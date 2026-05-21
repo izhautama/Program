@@ -1,0 +1,753 @@
+/*************************************************************
+ * Presensi_RFID_v7.ino
+ * Sistem Presensi RFID — MA Nurul Huda Mergosono
+ * Versi 7 — Clean rewrite, full logging, dual-core
+ *
+ * ARSITEKTUR:
+ *   setup()   → cek semua hardware & jaringan, load data
+ *   Core 0    → RFID + LCD + Buzzer (responsif, <50ms)
+ *   Core 1    → WiFi keepalive + NTP retry + kirim antrian
+ *
+ * HARDWARE:
+ *   ESP32 + MFRC522 (SPI) + LCD I2C 16x2 + Buzzer aktif
+ *   MFRC522: SS=5, RST=4, SCK=18, MOSI=23, MISO=19, VCC=3.3V
+ *   LCD I2C : SDA=21, SCL=22, VCC=5V
+ *   Buzzer  : GPIO15 (aktif HIGH)
+ *************************************************************/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+#include <time.h>
+
+// ============================================================
+//   KONFIGURASI — ubah sesuai jaringan dan deployment
+// ============================================================
+const char* WIFI_SSID     = "CCTV MA";
+const char* WIFI_PASSWORD = "MAnuha1234";
+const char* GSCRIPT_ID    = "AKfycbz2I072wPz-uDBi71D4xUyhEfRzUkulrMQWZ0XfuwIGvzPWsI6Eypa0sKNj4crcKPtb2Q";
+
+const long  GMT_OFFSET  = 7 * 3600;   // WIB = UTC+7
+const int   DST_OFFSET  = 0;
+
+#define SS_PIN   5
+#define RST_PIN  4
+#define BUZZ_PIN 15
+#define MAX_KARTU 500
+
+const char* PATH_CACHE = "/induk.json";
+const char* PATH_QUEUE = "/queue.jsonl";
+
+// ============================================================
+//   STRUCT
+// ============================================================
+struct Kartu {
+  char uid[22];      // max 20 hex char + null
+  char nama[32];
+  char jabatan[12];
+  char kelas[16];
+};
+Kartu daftarKartu[MAX_KARTU];
+int   jumlahKartu = 0;
+
+// ============================================================
+//   OBJEK HARDWARE
+// ============================================================
+MFRC522           mfrc522(SS_PIN, RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ============================================================
+//   STATE GLOBAL
+// ============================================================
+volatile bool wifiOnline   = false;
+volatile bool ntpSynced    = false;
+volatile bool googleOKGlob = false;
+volatile int  antrianSisa  = 0;
+volatile bool sedangKirim  = false;
+
+String URL_BASE = "";
+
+SemaphoreHandle_t mutexLCD;
+SemaphoreHandle_t mutexQueue;
+
+// ============================================================
+//   LOGGING HELPER
+// ============================================================
+void sep(char c = '-', int n = 56) {
+  for (int i = 0; i < n; i++) Serial.print(c);
+  Serial.println();
+}
+
+void logOK(const String& msg)   { Serial.println("  [OK] " + msg); }
+void logWARN(const String& msg) { Serial.println("  [!!] " + msg); }
+void logINFO(const String& msg) { Serial.println("       " + msg); }
+
+// ============================================================
+//   LCD (thread-safe)
+// ============================================================
+void lcdShow(const String& l1, const String& l2 = "") {
+  if (xSemaphoreTake(mutexLCD, pdMS_TO_TICKS(100)) == pdTRUE) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print(l1.substring(0, 16));
+    if (l2.length()) { lcd.setCursor(0, 1); lcd.print(l2.substring(0, 16)); }
+    xSemaphoreGive(mutexLCD);
+  }
+}
+
+void lcdStatus() {
+  String s;
+  if (!wifiOnline)      s = antrianSisa > 0 ? "[Offline " + String(antrianSisa) + "]" : "[Offline]";
+  else if (sedangKirim) s = "[Kirim " + String(antrianSisa) + "]";
+  else if (antrianSisa) s = "[Antri " + String(antrianSisa) + "]";
+  else                  s = "[Online]";
+  while (s.length() < 16) s += ' ';
+  if (xSemaphoreTake(mutexLCD, pdMS_TO_TICKS(30)) == pdTRUE) {
+    lcd.setCursor(0, 1); lcd.print(s.substring(0, 16));
+    xSemaphoreGive(mutexLCD);
+  }
+}
+
+// ============================================================
+//   BUZZER
+// ============================================================
+void buzzerHadir() { digitalWrite(BUZZ_PIN, HIGH); delay(350); digitalWrite(BUZZ_PIN, LOW); }
+void buzzerAsing() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZ_PIN, HIGH); delay(70);
+    digitalWrite(BUZZ_PIN, LOW);  delay(70);
+  }
+}
+void buzzerBoot() {
+  // 2x pendek saat sistem siap
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZ_PIN, HIGH); delay(100);
+    digitalWrite(BUZZ_PIN, LOW);  delay(100);
+  }
+}
+
+// ============================================================
+//   HELPER
+// ============================================================
+String formatUID(byte* buf, byte len) {
+  String uid = "";
+  for (byte i = 0; i < len; i++) {
+    if (buf[i] < 0x10) uid += "0";
+    uid += String(buf[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+String waktuSekarang() {
+  struct tm t;
+  if (!getLocalTime(&t, 200)) return "0000-00-00 00:00:00";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+  return String(buf);
+}
+
+String urlEncode(const String& s) {
+  String out = "";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isAlphaNumeric(c) || c=='-' || c=='_' || c=='.' || c=='~') out += c;
+    else if (c == ' ') out += '+';
+    else { char b[4]; snprintf(b, sizeof(b), "%%%02X", (unsigned char)c); out += b; }
+  }
+  return out;
+}
+
+int cariKartu(const String& uid) {
+  for (int i = 0; i < jumlahKartu; i++)
+    if (uid.equals(daftarKartu[i].uid)) return i;
+  return -1;
+}
+
+// ============================================================
+//   HTTP GET
+// ============================================================
+bool httpGet(const String& url, String& resp) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  https.setTimeout(20000);
+  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!https.begin(client, url)) return false;
+  int code = https.GET();
+  resp = https.getString();
+  https.end();
+  return (code == HTTP_CODE_OK);
+}
+
+// ============================================================
+//   PARSE JSON → RAM
+// ============================================================
+int parseJSON(const String& json) {
+  DynamicJsonDocument doc(200000);
+  if (deserializeJson(doc, json) || !doc["ok"].as<bool>()) return -1;
+  JsonArray data = doc["data"].as<JsonArray>();
+  int n = 0;
+  for (JsonArray row : data) {
+    if (n >= MAX_KARTU || row.size() < 4) continue;
+    const char* r0 = row[0]|""; const char* r1 = row[1]|"";
+    const char* r2 = row[2]|""; const char* r3 = row[3]|"";
+    strncpy(daftarKartu[n].uid,     r0, 21); daftarKartu[n].uid[21]     = '\0';
+    strncpy(daftarKartu[n].nama,    r1, 31); daftarKartu[n].nama[31]    = '\0';
+    strncpy(daftarKartu[n].jabatan, r2, 11); daftarKartu[n].jabatan[11] = '\0';
+    strncpy(daftarKartu[n].kelas,   r3, 15); daftarKartu[n].kelas[15]   = '\0';
+    for (int c = 0; daftarKartu[n].uid[c]; c++)
+      daftarKartu[n].uid[c] = toupper(daftarKartu[n].uid[c]);
+    n++;
+  }
+  jumlahKartu = n;
+  return n;
+}
+
+// ============================================================
+//   QUEUE (flash, tahan mati listrik)
+// ============================================================
+int hitungAntrian() {
+  if (!LittleFS.exists(PATH_QUEUE)) return 0;
+  File f = LittleFS.open(PATH_QUEUE, "r");
+  if (!f) return 0;
+  int n = 0;
+  while (f.available()) if (f.read() == '\n') n++;
+  f.close(); return n;
+}
+
+void antrekanTap(const String& uid, const String& nama,
+                 const String& jabatan, const String& kelas,
+                 const String& ts, bool asing) {
+  if (xSemaphoreTake(mutexQueue, pdMS_TO_TICKS(500)) != pdTRUE) return;
+  File f = LittleFS.open(PATH_QUEUE, "a");
+  if (f) {
+    StaticJsonDocument<300> doc;
+    doc["uid"]=uid; doc["nama"]=nama; doc["jabatan"]=jabatan;
+    doc["kelas"]=kelas; doc["tap"]=ts;
+    if (asing) doc["asing"] = true;
+    String baris; serializeJson(doc, baris);
+    f.println(baris); f.close();
+  }
+  antrianSisa = hitungAntrian();
+  xSemaphoreGive(mutexQueue);
+}
+
+String bacaBarisPertama() {
+  if (!LittleFS.exists(PATH_QUEUE)) return "";
+  File f = LittleFS.open(PATH_QUEUE, "r");
+  if (!f) return "";
+  String s = f.readStringUntil('\n'); f.close();
+  s.trim(); return s;
+}
+
+void hapusBarisPertama() {
+  if (xSemaphoreTake(mutexQueue, pdMS_TO_TICKS(500)) != pdTRUE) return;
+  File src = LittleFS.open(PATH_QUEUE, "r");
+  if (!src) { xSemaphoreGive(mutexQueue); return; }
+  src.readStringUntil('\n');
+  File dst = LittleFS.open("/q.tmp", "w");
+  if (!dst) { src.close(); xSemaphoreGive(mutexQueue); return; }
+  while (src.available()) dst.write(src.read());
+  src.close(); dst.close();
+  LittleFS.remove(PATH_QUEUE);
+  LittleFS.rename("/q.tmp", PATH_QUEUE);
+  antrianSisa = hitungAntrian();
+  xSemaphoreGive(mutexQueue);
+}
+
+// ============================================================
+//   KIRIM TAP ke Google Sheets via GET query string
+//   GET tidak kena redirect loop seperti POST
+// ============================================================
+bool kirimTap(const String& uid, const String& nama,
+              const String& jabatan, const String& kelas,
+              const String& ts, bool asing) {
+  String url = URL_BASE
+    + "?aksi=tap"
+    + "&uid="     + urlEncode(uid)
+    + "&nama="    + urlEncode(nama)
+    + "&jabatan=" + urlEncode(jabatan)
+    + "&kelas="   + urlEncode(kelas)
+    + "&tap="     + urlEncode(ts)
+    + (asing ? "&asing=1" : "&asing=0");
+
+  String resp;
+  if (!httpGet(url, resp)) {
+    Serial.println("  [SYNC] httpGet gagal");
+    return false;
+  }
+  resp.trim();
+  if (resp.startsWith("OK")) return true;
+
+  // Tampilkan 120 char pertama response untuk debug
+  Serial.printf("  [SYNC] Server resp: %s\n", resp.substring(0, 120).c_str());
+  return false;
+}
+
+// ============================================================
+//   VERIFIKASI GOOGLE APPS SCRIPT
+// ============================================================
+bool cekGoogle() {
+  String resp;
+  if (!httpGet(URL_BASE + "?aksi=versi", resp)) return false;
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, resp)) return false;
+  return doc["ok"].as<bool>();
+}
+
+// ============================================================
+//   CORE 0 — taskPresensi
+//   Prioritas tinggi, tidak pernah menyentuh network
+//   Tap → respon <50ms
+// ============================================================
+void taskPresensi(void* param) {
+  Serial.printf("\n[CORE 0] taskPresensi aktif di core %d\n", xPortGetCoreID());
+  Serial.println("[CORE 0] Menangani: RFID + LCD + Buzzer");
+
+  String  uidLama   = "";
+  uint32_t tsLama   = 0;
+  uint32_t tReset   = 0;
+  bool     layarTap = false;
+
+  lcdShow("Tap kartu RFID", "");
+  lcdStatus();
+
+  for (;;) {
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      String uid = formatUID(mfrc522.uid.uidByte, mfrc522.uid.size);
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+
+      // Debounce 2 detik
+      if (uid == uidLama && millis() - tsLama < 2000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+      }
+      uidLama = uid; tsLama = millis();
+
+      String ts  = waktuSekarang();
+      int    idx = cariKartu(uid);
+
+      if (idx >= 0) {
+        Kartu& k = daftarKartu[idx];
+        Serial.printf("[TAP] DIKENAL  uid=%-20s nama=%s  kelas=%s\n",
+                      k.uid, k.nama, k.kelas);
+        buzzerHadir();
+        char n16[17]; strncpy(n16, k.nama,  16); n16[16] = '\0';
+        char k13[14]; strncpy(k13, k.kelas, 13); k13[13] = '\0';
+        lcdShow(String(n16), String(k13) + " OK");
+        antrekanTap(uid, k.nama, k.jabatan, k.kelas, ts, false);
+      } else {
+        Serial.printf("[TAP] ASING    uid=%s\n", uid.c_str());
+        buzzerAsing();
+        lcdShow("Kartu tdk dftr", uid.substring(0, 16));
+        antrekanTap(uid, "", "", "", ts, true);
+      }
+
+      layarTap = true;
+      tReset   = millis();
+    }
+
+    // Kembali ke standby setelah 2 detik
+    if (layarTap && millis() - tReset > 2000) {
+      layarTap = false;
+      lcdShow("Tap kartu RFID", "");
+    }
+
+    // Refresh status bar tiap detik saat standby
+    static uint32_t tStat = 0;
+    if (!layarTap && millis() - tStat > 1000) {
+      tStat = millis();
+      lcdStatus();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+}
+
+// ============================================================
+//   CORE 1 — taskSinkron
+//   Prioritas normal, jalan di background
+//   Tugas: WiFi keepalive + NTP retry + cek Google + kirim antrian
+// ============================================================
+void taskSinkron(void* param) {
+  Serial.printf("\n[CORE 1] taskSinkron aktif di core %d\n", xPortGetCoreID());
+  Serial.println("[CORE 1] Menangani: WiFi + NTP + Google + Antrian");
+
+  uint32_t tWifi   = 0;
+  uint32_t tNTP    = 0;
+  uint32_t tGoogle = 0;
+  int      gagal   = 0;
+  const int MAX_GAGAL = 5;
+
+  for (;;) {
+
+    // ── 1. WiFi keepalive tiap 5 detik ──────────────────
+    if (millis() - tWifi > 5000) {
+      tWifi = millis();
+      bool status = (WiFi.status() == WL_CONNECTED);
+
+      if (status && !wifiOnline) {
+        wifiOnline   = true;
+        ntpSynced    = false;
+        googleOKGlob = false;
+        Serial.printf("[SYNC] WiFi pulih — IP: %s\n", WiFi.localIP().toString().c_str());
+
+      } else if (!status) {
+        if (wifiOnline) {
+          wifiOnline   = false;
+          ntpSynced    = false;
+          googleOKGlob = false;
+          Serial.println("[SYNC] WiFi putus — mode offline");
+        }
+        Serial.print("[SYNC] Reconnect WiFi");
+        WiFi.disconnect(false);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        uint32_t tR = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - tR < 8000) {
+          vTaskDelay(pdMS_TO_TICKS(500));
+          Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+          wifiOnline = true;
+          Serial.printf("[SYNC] Reconnect OK — IP: %s\n", WiFi.localIP().toString().c_str());
+        } else {
+          Serial.println("[SYNC] Reconnect gagal, retry 5 detik");
+        }
+      }
+    }
+
+    // ── 2. NTP retry tiap 10 detik jika belum sync ──────
+    if (wifiOnline && !ntpSynced && millis() - tNTP > 10000) {
+      tNTP = millis();
+      configTime(GMT_OFFSET, DST_OFFSET, "pool.ntp.org", "time.google.com");
+      struct tm t;
+      if (getLocalTime(&t, 3000)) {
+        ntpSynced = true;
+        Serial.printf("[SYNC] NTP OK — %s\n", waktuSekarang().c_str());
+      } else {
+        Serial.println("[SYNC] NTP retry...");
+      }
+    }
+
+    // ── 3. Verifikasi Google tiap 15 detik jika belum OK ─
+    if (wifiOnline && ntpSynced && !googleOKGlob && millis() - tGoogle > 15000) {
+      tGoogle = millis();
+      Serial.print("[SYNC] Cek Google Apps Script");
+      if (cekGoogle()) {
+        googleOKGlob = true;
+        Serial.println(" — OK");
+      } else {
+        Serial.println(" — GAGAL, retry 15 detik");
+      }
+    }
+
+    // ── 4. Kirim antrian jika semua kondisi terpenuhi ────
+    if (wifiOnline && ntpSynced && googleOKGlob && antrianSisa > 0) {
+      String baris = bacaBarisPertama();
+      if (baris.length() == 0) {
+        antrianSisa = hitungAntrian();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
+
+      // Parse baris JSON
+      StaticJsonDocument<300> doc;
+      if (deserializeJson(doc, baris)) {
+        Serial.println("[SYNC] Baris JSON rusak, dibuang");
+        hapusBarisPertama(); gagal = 0;
+        continue;
+      }
+
+      String uid     = String((const char*)(doc["uid"]    |""));
+      String nama    = String((const char*)(doc["nama"]   |""));
+      String jabatan = String((const char*)(doc["jabatan"]|""));
+      String kelas   = String((const char*)(doc["kelas"]  |""));
+      String ts      = String((const char*)(doc["tap"]    |""));
+      bool   asing   = doc["asing"]|false;
+
+      sedangKirim = true;
+      Serial.printf("[SYNC] Kirim uid=%-20s antrian=%d\n", uid.c_str(), antrianSisa);
+
+      bool ok = kirimTap(uid, nama, jabatan, kelas, ts, asing);
+
+      if (ok) {
+        hapusBarisPertama();
+        gagal = 0;
+        Serial.printf("[SYNC] Sukses — sisa antrian: %d\n", antrianSisa);
+        sedangKirim = (antrianSisa > 0);
+        vTaskDelay(pdMS_TO_TICKS(800));
+      } else {
+        gagal++;
+        Serial.printf("[SYNC] Gagal %d/%d\n", gagal, MAX_GAGAL);
+        if (gagal >= MAX_GAGAL) {
+          Serial.println("[SYNC] Max retry — baris dibuang, lanjut berikutnya");
+          hapusBarisPertama();
+          gagal = 0;
+          googleOKGlob = false;  // re-verifikasi Google sebelum kirim lagi
+        } else {
+          vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+        sedangKirim = false;
+      }
+
+    } else {
+      sedangKirim = false;
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+  }
+}
+
+// ============================================================
+//   SETUP — boot sequence lengkap dengan logging detail
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  sep('=');
+  Serial.println("  SISTEM PRESENSI RFID");
+  Serial.println("  MA Nurul Huda Mergosono, Malang");
+  Serial.println("  Dual-Core FreeRTOS v7");
+  sep('=');
+  Serial.println();
+
+  // Mutex WAJIB dibuat sebelum apapun yang pakai mutex
+  mutexLCD   = xSemaphoreCreateMutex();
+  mutexQueue = xSemaphoreCreateMutex();
+  pinMode(BUZZ_PIN, OUTPUT);
+  digitalWrite(BUZZ_PIN, LOW);
+
+  // ── [1/7] LCD ──────────────────────────────────────
+  sep(); Serial.println("  [1/7] LCD I2C 16x2"); sep();
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcdShow("MA Nurul Huda", "Memuat...");
+  logOK("LCD menyala, backlight ON");
+  logINFO("Alamat I2C: 0x27  SDA=GPIO21  SCL=GPIO22");
+  Serial.println();
+
+  // ── [2/7] MFRC522 RFID ─────────────────────────────
+  sep(); Serial.println("  [2/7] RFID Reader MFRC522"); sep();
+  SPI.begin();
+  mfrc522.PCD_Init();
+  delay(100);
+  byte ver = mfrc522.PCD_ReadRegister(MFRC522::VersionReg);
+  if (ver == 0x00 || ver == 0xFF) {
+    logWARN("MFRC522 TIDAK TERDETEKSI — cek wiring SPI");
+    logINFO("SS=GPIO5  SCK=GPIO18  MOSI=GPIO23  MISO=GPIO19  RST=GPIO4");
+    logINFO("Pastikan VCC=3.3V (bukan 5V)");
+  } else {
+    logOK("MFRC522 terdeteksi");
+    logINFO("VersionReg : 0x" + String(ver, HEX));
+    logINFO("Wiring     : SS=5  SCK=18  MOSI=23  MISO=19  RST=4  VCC=3.3V");
+  }
+  Serial.println();
+
+  // ── [3/7] Buzzer ───────────────────────────────────
+  sep(); Serial.println("  [3/7] Buzzer"); sep();
+  logOK("Buzzer aktif HIGH GPIO15");
+  logINFO("Tes buzzer...");
+  digitalWrite(BUZZ_PIN, HIGH); delay(80); digitalWrite(BUZZ_PIN, LOW);
+  logINFO("Buzzer OK");
+  Serial.println();
+
+  // ── [4/7] Flash Storage (LittleFS) ─────────────────
+  sep(); Serial.println("  [4/7] Flash Storage — LittleFS"); sep();
+  if (!LittleFS.begin(true)) {
+    logWARN("GAGAL mount LittleFS — sistem berhenti");
+    lcdShow("Flash Error!", "Restart alat");
+    while (1) delay(1000);
+  }
+  antrianSisa = hitungAntrian();
+  logOK("LittleFS mounted");
+  logINFO("Cache  : " + String(LittleFS.exists(PATH_CACHE) ? "ADA" : "BELUM ADA"));
+  logINFO("Antrian: " + String(antrianSisa) + " tap offline tersimpan");
+  if (antrianSisa > 0) logINFO("→ Antrian akan dikirim saat WiFi & Google OK");
+  Serial.println();
+
+  // ── [5/7] WiFi ─────────────────────────────────────
+  sep(); Serial.println("  [5/7] WiFi"); sep();
+  logINFO("SSID : " + String(WIFI_SSID));
+  lcdShow("Sambung WiFi...", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  URL_BASE = String("https://script.google.com/macros/s/") + GSCRIPT_ID + "/exec";
+  Serial.print("       Connecting");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println();
+  wifiOnline = (WiFi.status() == WL_CONNECTED);
+  if (wifiOnline) {
+    logOK("WiFi terhubung");
+    logINFO("IP     : " + WiFi.localIP().toString());
+    logINFO("Signal : " + String(WiFi.RSSI()) + " dBm");
+  } else {
+    logWARN("WiFi GAGAL — mode offline, pakai cache");
+    logINFO("Sistem tetap berjalan menggunakan data cache");
+  }
+  Serial.println();
+
+  // ── [6/7] NTP + Google Apps Script ─────────────────
+  sep(); Serial.println("  [6/7] Internet Services (NTP + Google)"); sep();
+  bool googleOK = false;
+
+  if (wifiOnline) {
+    // NTP sync — retry 30 detik
+    lcdShow("Sync NTP...", "");
+    logINFO("Sync NTP (pool.ntp.org + time.google.com)...");
+    configTime(GMT_OFFSET, DST_OFFSET, "pool.ntp.org", "time.google.com");
+    Serial.print("       Menunggu NTP");
+    uint32_t tNTP = millis();
+    struct tm tm_info;
+    while (millis() - tNTP < 30000) {
+      if (getLocalTime(&tm_info, 1000)) { ntpSynced = true; break; }
+      Serial.print(".");
+      delay(200);
+    }
+    Serial.println();
+    if (ntpSynced) {
+      logOK("NTP sync berhasil — " + waktuSekarang());
+    } else {
+      logWARN("NTP GAGAL — Core 1 akan retry tiap 10 detik");
+      logINFO("Tap kartu tetap bisa dilakukan (timestamp kosong)");
+    }
+    Serial.println();
+
+    // Google Apps Script
+    lcdShow("Cek Google...", "");
+    logINFO("Menghubungi Google Apps Script...");
+    logINFO("URL : " + URL_BASE.substring(0, 60) + "...");
+    String respVersi;
+    bool httpOK = httpGet(URL_BASE + "?aksi=versi", respVersi);
+    if (httpOK) {
+      StaticJsonDocument<256> dv;
+      if (!deserializeJson(dv, respVersi) && dv["ok"].as<bool>()) {
+        googleOK     = true;
+        googleOKGlob = true;
+        logOK("Google Apps Script aktif");
+        logINFO("Versi data : " + String((const char*)dv["v"]));
+      } else {
+        logWARN("Google Script response tidak valid");
+        logINFO("Response   : " + respVersi.substring(0, 100));
+        logINFO("→ Pastikan script v6 sudah di-deploy ulang (New Deployment)");
+        logINFO("→ Cek: URL/exec?aksi=versi harus return {\"ok\":true,...}");
+      }
+    } else {
+      logWARN("Google Script tidak bisa dijangkau");
+      logINFO("→ Cek GSCRIPT_ID di kode, pastikan deployment aktif");
+      logINFO("→ Core 1 akan retry setiap 15 detik");
+    }
+  } else {
+    logINFO("[6/7] NTP + Google — SKIP (tidak ada WiFi)");
+  }
+  Serial.println();
+
+  // ── [7/7] Data Induk ───────────────────────────────
+  sep(); Serial.println("  [7/7] Data Induk"); sep();
+  bool dataOK = false;
+
+  if (wifiOnline && googleOK) {
+    lcdShow("Download data..", "Tunggu...");
+    logINFO("Download Data_Induk dari Google Sheets...");
+    String respInduk;
+    uint32_t tDl = millis();
+    bool dlOK = httpGet(URL_BASE + "?aksi=induk", respInduk);
+    uint32_t durasi = millis() - tDl;
+
+    if (dlOK) {
+      int nKartu = parseJSON(respInduk);
+      if (nKartu > 0) {
+        File f = LittleFS.open(PATH_CACHE, "w");
+        if (f) { f.print(respInduk); f.close(); }
+        logOK(String(nKartu) + " kartu diunduh & disimpan ke flash (" + String(durasi) + "ms)");
+        dataOK = true;
+      } else {
+        logWARN("Parse JSON gagal — response: " + respInduk.substring(0, 80));
+      }
+    } else {
+      logWARN("Download gagal — pakai cache lama");
+    }
+  }
+
+  if (!dataOK) {
+    if (LittleFS.exists(PATH_CACHE)) {
+      File f = LittleFS.open(PATH_CACHE, "r");
+      String payload = f.readString(); f.close();
+      int nKartu = parseJSON(payload);
+      if (nKartu > 0) {
+        logOK(String(nKartu) + " kartu dimuat dari cache flash");
+        dataOK = true;
+      } else {
+        logWARN("Cache korup — hapus dan boot ulang dengan internet");
+        lcdShow("Cache korup!", "Butuh internet");
+        while (1) delay(1000);
+      }
+    } else {
+      logWARN("Tidak ada cache — boot pertama WAJIB online");
+      lcdShow("Tidak ada data!", "Butuh internet");
+      while (1) delay(1000);
+    }
+  }
+  Serial.println();
+
+  // ── TABEL DATA KARTU ───────────────────────────────
+  sep();
+  Serial.println("  DATA KARTU AKTIF");
+  sep();
+  Serial.println("  No  UID                    Nama                 Jabatan  Kelas");
+  sep();
+  for (int i = 0; i < jumlahKartu; i++) {
+    Serial.printf("  %-3d %-22s %-20s %-8s %s\n",
+      i+1, daftarKartu[i].uid, daftarKartu[i].nama,
+      daftarKartu[i].jabatan, daftarKartu[i].kelas);
+  }
+  sep();
+  Serial.println();
+
+  // ── RINGKASAN STATUS ───────────────────────────────
+  sep('=');
+  Serial.println("  RINGKASAN STATUS SISTEM");
+  sep('=');
+  Serial.printf("  %-20s : %s\n", "LCD I2C",       "OK");
+  Serial.printf("  %-20s : %s\n", "RFID MFRC522",  (ver!=0&&ver!=0xFF) ? "OK" : "GAGAL");
+  Serial.printf("  %-20s : %s\n", "Buzzer",         "OK");
+  Serial.printf("  %-20s : %s\n", "Flash LittleFS", "OK");
+  Serial.printf("  %-20s : %s\n", "WiFi",           wifiOnline  ? "ONLINE"        : "OFFLINE");
+  Serial.printf("  %-20s : %s\n", "NTP",            ntpSynced   ? waktuSekarang().c_str() : "BELUM SYNC");
+  Serial.printf("  %-20s : %s\n", "Google Script",  googleOK    ? "OK"            : "GAGAL/RETRY");
+  Serial.printf("  %-20s : %s\n", "Data Induk",     dataOK      ? "OK"            : "GAGAL");
+  sep('-');
+  Serial.printf("  %-20s : %d kartu\n",    "Jumlah kartu",    jumlahKartu);
+  Serial.printf("  %-20s : %d tap\n",      "Antrian offline", antrianSisa);
+  Serial.printf("  %-20s : %d byte\n",     "Heap bebas",      ESP.getFreeHeap());
+  Serial.printf("  %-20s : %s\n",          "Mode",            wifiOnline ? "ONLINE" : "OFFLINE");
+  sep('=');
+  Serial.println();
+
+  // Spawn dua task
+  xTaskCreatePinnedToCore(taskPresensi, "Presensi", 8192,  NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(taskSinkron,  "Sinkron",  16384, NULL, 1, NULL, 1);
+
+  buzzerBoot();   // 2x pendek tanda sistem siap
+
+  sep('=');
+  Serial.println("  SISTEM SIAP — DUAL-CORE AKTIF");
+  Serial.println("  Core 0 : RFID + LCD + Buzzer (tap responsif <50ms)");
+  Serial.println("  Core 1 : WiFi + NTP + Google + Antrian (background)");
+  sep('=');
+  Serial.println();
+}
+
+void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }
